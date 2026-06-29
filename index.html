@@ -5,6 +5,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Klee+One:wght@400;600&family=Caveat:wght@400;600;700&family=Quicksand:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{
     --sky-top:#BFE0F0;
@@ -161,12 +162,34 @@
     .jarwrap.shake{animation:none}
     .letter{animation:none;transform:none;opacity:1}
   }
+  /* jar-code sync */
+  .code-input{width:100%;border:1.5px solid rgba(157,140,116,.3);border-radius:14px;
+    background:#FFFDF6;padding:12px 14px;color:var(--ink);font-family:'Quicksand';font-size:1rem}
+  .code-input:focus{outline:none;border-color:var(--meadow);box-shadow:0 0 0 3px rgba(154,195,131,.25)}
+  .hint{font-size:.82rem;color:var(--ink-soft);margin:10px 0 0;line-height:1.45}
+  .jar-tag{font-family:'Quicksand';font-size:.82rem;color:var(--ink-soft);margin:-8px 0 16px}
+  .jar-tag b{color:var(--meadow-deep)}
+  .jar-tag a{color:var(--meadow-deep);cursor:pointer}
 </style>
 
 <div class="wrap">
   <h1>Gratitude Jar</h1>
   <p class="tagline">a little note for every good day</p>
 
+  <p class="jar-tag" id="userTag" hidden></p>
+
+  <div class="panel" id="authPanel" hidden>
+    <label for="email">Sign in to your jar</label>
+    <input class="code-input" id="email" type="email" placeholder="you@email.com" autocomplete="email" spellcheck="false" style="margin-bottom:10px">
+    <input class="code-input" id="password" type="password" placeholder="password (6+ characters)" autocomplete="current-password">
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn btn-add" id="signInBtn" style="flex:1;margin-top:0">Sign in</button>
+      <button class="btn" id="signUpBtn" style="flex:1;background:transparent;border:1.5px solid rgba(157,140,116,.45);color:var(--meadow-deep);font-weight:600">Create account</button>
+    </div>
+    <p class="hint" id="authMsg">Your letters stay private to your account and follow you to any device you sign in on.</p>
+  </div>
+
+  <div id="jarUI" hidden>
   <div class="scene">
     <div class="mound"></div>
     <div id="grasses"></div>
@@ -207,6 +230,7 @@
   <button class="btn btn-draw" id="drawBtn">Draw today's letter</button>
   <br>
   <button class="redraw" id="redrawBtn" hidden>draw a different one</button>
+  </div><!-- /#jarUI -->
 </div>
 
 <!-- revealed letter -->
@@ -228,24 +252,35 @@
 (function(){
   "use strict";
 
-  /* ---------- storage: works on a normal website (localStorage),
-       inside the Claude app (window.storage), or in-memory as a last resort ---------- */
-  const mem = {};
-  const hasAnthropic = typeof window!=="undefined" && window.storage && typeof window.storage.get==="function";
+  /* ===================================================================
+     CONFIG — to sync across your devices, paste your Supabase details
+     below. Leave them exactly as-is to just save on this one device
+     (no account needed).
+     =================================================================== */
+  const SUPABASE_URL      = "PASTE_YOUR_PROJECT_URL_HERE";
+  const SUPABASE_ANON_KEY = "PASTE_YOUR_ANON_PUBLIC_KEY_HERE";
+
+  /* ---------- local storage (cache + offline / single-device fallback) ---------- */
   const hasLS = (function(){ try{ const k="__gj_test"; localStorage.setItem(k,"1"); localStorage.removeItem(k); return true; }catch(e){ return false; } })();
-  async function load(key, fallback){
-    try{
-      if(hasAnthropic){ const r=await window.storage.get(key); return r ? JSON.parse(r.value) : fallback; }
-      if(hasLS){ const v=localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
-      return (key in mem) ? mem[key] : fallback;
-    }catch(e){ return fallback; }
+  function lsGet(key, fallback){ try{ if(!hasLS) return fallback; const v=localStorage.getItem(key); return v?JSON.parse(v):fallback; }catch(e){ return fallback; } }
+  function lsSet(key, value){ try{ if(hasLS) localStorage.setItem(key, JSON.stringify(value)); }catch(e){} }
+  // the once-a-day draw stays on this device, which is perfectly fine
+  async function load(key, fallback){ return lsGet(key, fallback); }
+  async function save(key, value){ lsSet(key, value); }
+
+  /* ---------- cloud sync + private accounts (Supabase) ---------- */
+  const cloudOn = /^https:\/\//.test(SUPABASE_URL) && SUPABASE_ANON_KEY.length > 20 && typeof window.supabase !== "undefined";
+  const db = cloudOn ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+  let userId = null;   // set once signed in; a database rule ties each letter to this id
+  async function cloudLoad(){
+    // row-level security automatically limits this to the signed-in user's letters
+    const { data, error } = await db.from("letters").select("id,text,date,created_at").order("created_at",{ascending:true});
+    if(error) throw error;
+    return (data||[]).map(r=>({id:r.id, text:r.text, date:r.date}));
   }
-  async function save(key, value){
-    try{
-      if(hasAnthropic){ await window.storage.set(key, JSON.stringify(value)); return; }
-      if(hasLS){ localStorage.setItem(key, JSON.stringify(value)); return; }
-      mem[key]=value;
-    }catch(e){ mem[key]=value; }
+  async function cloudInsert(letter){
+    const { error } = await db.from("letters").insert({ id:letter.id, text:letter.text, date:letter.date });
+    if(error) throw error;
   }
 
   /* ---------- helpers ---------- */
@@ -343,13 +378,18 @@
   async function addLetter(){
     const ta=$("entry"); const text=ta.value.trim();
     if(!text){ ta.focus(); toast("write a little something first 🌱"); return; }
-    letters.push({id:uid(), text, date:todayKey()});
-    await save("letters", letters);
+    const letter={id:uid(), text, date:todayKey()};
+    letters.push(letter);
+    lsSet("letters:"+(userId||"local"), letters);   // cache immediately
     ta.value="";
     renderPile(); renderCount();
     // gentle drop bounce
     const jw=$("jarwrap"); jw.classList.remove("shake"); void jw.offsetWidth; jw.classList.add("shake");
     toast("folded into the jar ✦");
+    if(cloudOn && userId){
+      try{ await cloudInsert(letter); }
+      catch(e){ toast("saved on this device — couldn't reach the cloud just now"); }
+    }
   }
 
   /* ---------- draw / reveal ---------- */
@@ -405,12 +445,83 @@
   $("revealBack").addEventListener("click", e=>{ if(e.target===$("revealBack")) $("revealBack").classList.remove("open"); });
   document.addEventListener("keydown", e=>{ if(e.key==="Escape") $("revealBack").classList.remove("open"); });
 
-  /* ---------- boot ---------- */
-  (async function init(){
-    letters = await load("letters", []);
-    drawState = await load("draw-state", null);
+  /* ---------- accounts + boot ---------- */
+  function setAuthMsg(t){ $("authMsg").textContent = t; }
+  function showAuth(show){
+    $("authPanel").hidden = !show;
+    $("jarUI").hidden = show;
+    if(show) $("userTag").hidden = true;
+  }
+  function renderUserTag(email){
+    if(cloudOn && userId){
+      $("userTag").innerHTML = "signed in as <b>"+(email||"").replace(/</g,"&lt;")+"</b> · <a id='signOut'>sign out</a>";
+      $("userTag").hidden = false;
+    } else { $("userTag").hidden = true; }
+  }
+  async function openJar(){
+    if(cloudOn && userId){
+      try{ letters = await cloudLoad(); lsSet("letters:"+userId, letters); }
+      catch(e){ letters = lsGet("letters:"+userId, []); toast("offline — showing the last synced copy"); }
+    } else {
+      letters = lsGet("letters:local", null);
+      if(letters===null) letters = lsGet("letters", []); // migrate older single-device saves
+    }
     if(!Array.isArray(letters)) letters=[];
     renderPile(); renderCount();
+  }
+
+  async function applySession(session){
+    const user = session && session.user ? session.user : null;
+    userId = user ? user.id : null;
+    if(userId){
+      showAuth(false);
+      renderUserTag(user.email);
+      await openJar();
+    } else {
+      letters = []; renderPile(); renderCount();
+      showAuth(true);
+    }
+  }
+
+  (async function init(){
+    drawState = await load("draw-state", null);
+    if(!cloudOn){                      // no account system configured → simple single-device mode
+      $("jarUI").hidden = false;
+      $("authPanel").hidden = true;
+      $("userTag").hidden = true;
+      await openJar();
+      return;
+    }
+    const { data } = await db.auth.getSession();
+    await applySession(data ? data.session : null);
+    db.auth.onAuthStateChange((_evt, s)=>{ applySession(s); });
   })();
+
+  async function doAuth(kind){
+    const email=$("email").value.trim();
+    const pw=$("password").value;
+    if(!email || pw.length<6){ setAuthMsg("Enter your email and a password of at least 6 characters."); return; }
+    setAuthMsg(kind==="up" ? "Creating your account…" : "Signing in…");
+    try{
+      if(kind==="up"){
+        const { data, error } = await db.auth.signUp({ email, password:pw });
+        if(error) throw error;
+        if(!data.session){ setAuthMsg("Almost there — check your email to confirm, then sign in."); return; }
+      } else {
+        const { error } = await db.auth.signInWithPassword({ email, password:pw });
+        if(error) throw error;
+      }
+      $("password").value="";
+      // onAuthStateChange reveals the jar
+    }catch(e){
+      setAuthMsg((e && e.message) ? e.message : "Something went wrong — please try again.");
+    }
+  }
+  $("signInBtn").addEventListener("click", ()=>doAuth("in"));
+  $("signUpBtn").addEventListener("click", ()=>doAuth("up"));
+  $("password").addEventListener("keydown", e=>{ if(e.key==="Enter") doAuth("in"); });
+  document.addEventListener("click", async (e)=>{
+    if(e.target && e.target.id==="signOut"){ await db.auth.signOut(); }
+  });
 })();
 </script>
